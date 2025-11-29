@@ -14,6 +14,7 @@ const mongoose = require('mongoose');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const multer = require('multer');
+const cloudinary = require('cloudinary').v2;
 require('dotenv').config();
 
 // =====================================================
@@ -34,12 +35,19 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use(morgan('tiny'));
 
-// Static serving for uploaded files
+// Static serving for uploaded files (legacy/local uploads)
 const UPLOAD_ROOT = path.join(__dirname, 'uploads');
 if (!fs.existsSync(UPLOAD_ROOT)) {
   fs.mkdirSync(UPLOAD_ROOT, { recursive: true });
 }
 app.use('/uploads', express.static(UPLOAD_ROOT));
+
+// Cloudinary configuration (for images/videos stored off-disk)
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
 
 // =====================================================
 // ENV / SECURITY HELPERS
@@ -506,21 +514,10 @@ async function authRefresh(req, res) {
 // GALLERY API – /api/v1/gallery (list/item/upload/like/stats)
 // =====================================================
 
-// Multer storage for gallery uploads
-const galleryStorage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const isVideo = file.mimetype.startsWith('video/');
-    const dir = path.join(UPLOAD_ROOT, isVideo ? 'videos' : 'images');
-    fs.mkdirSync(dir, { recursive: true });
-    cb(null, dir);
-  },
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname) || '.bin';
-    cb(null, `${Date.now()}_${Math.random().toString(36).slice(2)}${ext}`);
-  },
-});
+// Multer storage for gallery uploads (use memory so we can send buffers to Cloudinary)
+const galleryStorage = multer.memoryStorage();
 
-const uploadGallery = multer({ storage: galleryStorage, limits: { fileSize: 10 * 1024 * 1024 } });
+const uploadGallery = multer({ storage: galleryStorage, limits: { fileSize: 20 * 1024 * 1024 } });
 
 app.all('/api/v1/gallery', async (req, res) => {
   const method = req.method;
@@ -557,6 +554,17 @@ app.all('/api/v1/gallery', async (req, res) => {
     return sendError(res, 'Internal server error', 500);
   }
 });
+
+function buildFileUrls(baseUrl, file_path, thumbnail_path) {
+  const normalize = (p) => {
+    if (!p) return null;
+    if (/^https?:\/\//i.test(p)) return p;
+    return `${baseUrl}/${p.replace(/\\/g, '/')}`;
+  };
+  const file_url = normalize(file_path);
+  const thumb_url = normalize(thumbnail_path) || file_url;
+  return { file_url, thumbnail_url: thumb_url };
+}
 
 async function galleryList(req, res) {
   const limit = Math.min(50, Math.max(1, parseInt(req.query.limit || '20', 10)));
@@ -601,10 +609,7 @@ async function galleryList(req, res) {
     items.map(async (item) => {
       const authorUser = await User.findById(item.user_id).lean();
       const tags = Array.isArray(item.tags) ? item.tags : [];
-      const file_url = `${baseUrl}/${item.file_path.replace(/\\/g, '/')}`;
-      const thumbnail_url = item.thumbnail_path
-        ? `${baseUrl}/${item.thumbnail_path.replace(/\\/g, '/')}`
-        : file_url;
+      const { file_url, thumbnail_url } = buildFileUrls(baseUrl, item.file_path, item.thumbnail_path);
       return {
         ...item,
         id: item._id,
@@ -646,10 +651,7 @@ async function galleryItem(req, res) {
 
   const authorUser = await User.findById(item.user_id).lean();
   const baseUrl = process.env.SITE_URL || (req.protocol + '://' + req.get('host'));
-  const file_url = `${baseUrl}/${item.file_path.replace(/\\/g, '/')}`;
-  const thumbnail_url = item.thumbnail_path
-    ? `${baseUrl}/${item.thumbnail_path.replace(/\\/g, '/')}`
-    : file_url;
+  const { file_url, thumbnail_url } = buildFileUrls(baseUrl, item.file_path, item.thumbnail_path);
 
   let user_liked = false;
   if (currentUser) {
@@ -692,10 +694,7 @@ async function galleryUser(req, res) {
 
   const enriched = items.map((item) => {
     const tags = Array.isArray(item.tags) ? item.tags : [];
-    const file_url = `${baseUrl}/${item.file_path.replace(/\\/g, '/')}`;
-    const thumbnail_url = item.thumbnail_path
-      ? `${baseUrl}/${item.thumbnail_path.replace(/\\/g, '/')}`
-      : file_url;
+    const { file_url, thumbnail_url } = buildFileUrls(baseUrl, item.file_path, item.thumbnail_path);
     return { ...item, id: item._id, tags, file_url, thumbnail_url, author_name: user.name, author_username: user.username };
   });
 
@@ -744,14 +743,28 @@ async function gallerySearch(req, res) {
 
   const enriched = items.map((item) => {
     const tags = Array.isArray(item.tags) ? item.tags : [];
-    const file_url = `${baseUrl}/${item.file_path.replace(/\\/g, '/')}`;
-    const thumbnail_url = item.thumbnail_path
-      ? `${baseUrl}/${item.thumbnail_path.replace(/\\/g, '/')}`
-      : file_url;
+    const { file_url, thumbnail_url } = buildFileUrls(baseUrl, item.file_path, item.thumbnail_path);
     return { ...item, id: item._id, tags, file_url, thumbnail_url };
   });
 
   sendSuccess(res, { items: enriched });
+}
+
+async function uploadToCloudinary(file) {
+  const isVideo = file.mimetype.startsWith('video/');
+  const folder = isVideo ? 'cousinsvault/videos' : 'cousinsvault/images';
+  const resource_type = isVideo ? 'video' : 'image';
+
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      { folder, resource_type },
+      (err, result) => {
+        if (err) return reject(err);
+        resolve(result);
+      },
+    );
+    stream.end(file.buffer);
+  });
 }
 
 async function galleryUpload(req, res) {
@@ -774,28 +787,58 @@ async function galleryUpload(req, res) {
 
     const isVideo = file.mimetype.startsWith('video/');
 
+    let uploadResult;
+    try {
+      uploadResult = await uploadToCloudinary(file);
+    } catch (err) {
+      console.error('Cloudinary upload error', err);
+      return sendError(res, 'Failed to upload media', 500);
+    }
+
     const galleryItem = await GalleryItem.create({
       user_id: req.user.user_id,
       title,
       description,
       type: isVideo ? 'video' : 'image',
-      file_path: path.relative(process.cwd(), file.path).replace(/\\/g, '/'),
-      file_size: file.size,
+      file_path: uploadResult.secure_url, // store full Cloudinary URL
+      file_size: uploadResult.bytes || file.size,
       mime_type: file.mimetype,
-      width: null,
-      height: null,
-      duration: null,
-      thumbnail_path: null,
+      width: uploadResult.width || null,
+      height: uploadResult.height || null,
+      duration: uploadResult.duration || null,
+      thumbnail_path: uploadResult.secure_url,
       tags,
       is_private: !!req.body.is_private,
     });
 
-    // Optionally bump per-cousin vault stats if you map users to cousins.
+    // Also record per-cousin upload and bump stats for the Vault view
+    const cousin = (req.user.username || '').toLowerCase();
+    const allowedCousins = ['rubab', 'rahi', 'abir'];
+    if (allowedCousins.includes(cousin)) {
+      try {
+        await CousinUpload.create({
+          cousin,
+          title,
+          description,
+          file_path: galleryItem.file_path,
+          file_type: galleryItem.mime_type,
+        });
+        await bumpVaultStats(cousin, {
+          photos: isVideo ? 0 : 1,
+          videos: isVideo ? 1 : 0,
+          likes: 0,
+        });
+      } catch (err) {
+        console.error('Failed to record CousinUpload / bump stats', err);
+      }
+    }
 
     const baseUrl = process.env.SITE_URL || (req.protocol + '://' + req.get('host'));
+    const { file_url } = buildFileUrls(baseUrl, galleryItem.file_path, galleryItem.thumbnail_path);
+
     sendSuccess(res, {
       id: galleryItem._id,
-      file_url: `${baseUrl}/${galleryItem.file_path}`,
+      file_url,
       title: galleryItem.title,
     }, 'File uploaded successfully');
   });
@@ -1308,12 +1351,16 @@ app.get('/get_uploads.php', async (req, res) => {
       .lean();
 
     const baseUrl = process.env.SITE_URL || (req.protocol + '://' + req.get('host'));
-    const decorated = uploads.map((u) => ({
-      ...u,
-      file_url: `${baseUrl}/${u.file_path}`,
-      is_image: u.file_type && u.file_type.startsWith('image/'),
-      is_video: u.file_type && u.file_type.startsWith('video/'),
-    }));
+    const decorated = uploads.map((u) => {
+      const isExternal = /^https?:\/\//i.test(u.file_path || '');
+      const file_url = isExternal ? u.file_path : `${baseUrl}/${(u.file_path || '').replace(/\\/g, '/')}`;
+      return {
+        ...u,
+        file_url,
+        is_image: u.file_type && u.file_type.startsWith('image/'),
+        is_video: u.file_type && u.file_type.startsWith('video/'),
+      };
+    });
 
     res.json({
       success: true,
