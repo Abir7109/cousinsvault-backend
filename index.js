@@ -24,9 +24,13 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 4000;
 
+// Normalize CORS origin so trailing slashes in env don't break exact origin match
+const RAW_CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
+const NORMALIZED_CORS_ORIGIN = RAW_CORS_ORIGIN === '*' ? '*' : RAW_CORS_ORIGIN.replace(/\/$/, '');
+
 // CORS – allow Vercel frontend. You can restrict origins later if you want.
 app.use(cors({
-  origin: process.env.CORS_ORIGIN || '*',
+  origin: NORMALIZED_CORS_ORIGIN,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
 }));
