@@ -14,6 +14,7 @@ const mongoose = require('mongoose');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const multer = require('multer');
+const cloudinary = require('cloudinary').v2;
 require('dotenv').config();
 
 // =====================================================
@@ -51,6 +52,16 @@ const PASSWORD_SALT = process.env.PASSWORD_SALT || 'extra-salt-change-me';
 function sanitizeInput(value) {
   if (typeof value !== 'string') return value;
   return value.trim();
+}
+
+function isAbsoluteUrl(p) {
+  return typeof p === 'string' && /^https?:\/\//i.test(p);
+}
+
+function buildFileUrl(baseUrl, storedPath) {
+  if (!storedPath) return null;
+  if (isAbsoluteUrl(storedPath)) return storedPath;
+  return `${baseUrl}/${storedPath.replace(/\\/g, '/')}`;
 }
 
 function sendSuccess(res, data = {}, message = 'Success') {
@@ -167,6 +178,8 @@ const galleryItemSchema = new mongoose.Schema(
     is_private: { type: Boolean, default: false },
     view_count: { type: Number, default: 0 },
     like_count: { type: Number, default: 0 },
+    cloudinary_public_id: String,
+    cloudinary_resource_type: String,
   },
   opts,
 );
@@ -601,10 +614,8 @@ async function galleryList(req, res) {
     items.map(async (item) => {
       const authorUser = await User.findById(item.user_id).lean();
       const tags = Array.isArray(item.tags) ? item.tags : [];
-      const file_url = `${baseUrl}/${item.file_path.replace(/\\/g, '/')}`;
-      const thumbnail_url = item.thumbnail_path
-        ? `${baseUrl}/${item.thumbnail_path.replace(/\\/g, '/')}`
-        : file_url;
+      const file_url = buildFileUrl(baseUrl, item.file_path);
+      const thumbnail_url = buildFileUrl(baseUrl, item.thumbnail_path) || file_url;
       return {
         ...item,
         id: item._id,
@@ -646,10 +657,8 @@ async function galleryItem(req, res) {
 
   const authorUser = await User.findById(item.user_id).lean();
   const baseUrl = process.env.SITE_URL || (req.protocol + '://' + req.get('host'));
-  const file_url = `${baseUrl}/${item.file_path.replace(/\\/g, '/')}`;
-  const thumbnail_url = item.thumbnail_path
-    ? `${baseUrl}/${item.thumbnail_path.replace(/\\/g, '/')}`
-    : file_url;
+  const file_url = buildFileUrl(baseUrl, item.file_path);
+  const thumbnail_url = buildFileUrl(baseUrl, item.thumbnail_path) || file_url;
 
   let user_liked = false;
   if (currentUser) {
@@ -692,10 +701,8 @@ async function galleryUser(req, res) {
 
   const enriched = items.map((item) => {
     const tags = Array.isArray(item.tags) ? item.tags : [];
-    const file_url = `${baseUrl}/${item.file_path.replace(/\\/g, '/')}`;
-    const thumbnail_url = item.thumbnail_path
-      ? `${baseUrl}/${item.thumbnail_path.replace(/\\/g, '/')}`
-      : file_url;
+    const file_url = buildFileUrl(baseUrl, item.file_path);
+    const thumbnail_url = buildFileUrl(baseUrl, item.thumbnail_path) || file_url;
     return { ...item, id: item._id, tags, file_url, thumbnail_url, author_name: user.name, author_username: user.username };
   });
 
@@ -744,10 +751,8 @@ async function gallerySearch(req, res) {
 
   const enriched = items.map((item) => {
     const tags = Array.isArray(item.tags) ? item.tags : [];
-    const file_url = `${baseUrl}/${item.file_path.replace(/\\/g, '/')}`;
-    const thumbnail_url = item.thumbnail_path
-      ? `${baseUrl}/${item.thumbnail_path.replace(/\\/g, '/')}`
-      : file_url;
+    const file_url = buildFileUrl(baseUrl, item.file_path);
+    const thumbnail_url = buildFileUrl(baseUrl, item.thumbnail_path) || file_url;
     return { ...item, id: item._id, tags, file_url, thumbnail_url };
   });
 
@@ -772,30 +777,64 @@ async function galleryUpload(req, res) {
     if (Array.isArray(tagsRaw)) tags = tagsRaw.map(sanitizeInput);
     else if (typeof tagsRaw === 'string' && tagsRaw.trim()) tags = tagsRaw.split(',').map((t) => sanitizeInput(t));
 
-    const isVideo = file.mimetype.startsWith('video/');
+    let isVideo = file.mimetype.startsWith('video/');
+    let storedPath;
+    let thumbPath = null;
+    let width = null;
+    let height = null;
+    let duration = null;
+    let cloudinaryPublicId = null;
+    let cloudinaryResourceType = null;
+
+    if (cloudinaryEnabled) {
+      try {
+        const uploadResult = await cloudinary.uploader.upload(file.path, {
+          folder: 'cousinsvault/gallery',
+          resource_type: 'auto',
+        });
+        // Clean up local temp file
+        fs.unlink(file.path, () => {});
+
+        storedPath = uploadResult.secure_url;
+        thumbPath = uploadResult.secure_url;
+        isVideo = uploadResult.resource_type === 'video';
+        width = uploadResult.width || null;
+        height = uploadResult.height || null;
+        duration = uploadResult.duration || null;
+        cloudinaryPublicId = uploadResult.public_id;
+        cloudinaryResourceType = uploadResult.resource_type;
+      } catch (err) {
+        console.error('Cloudinary upload error', err);
+        return sendError(res, 'Upload failed', 500);
+      }
+    } else {
+      // Fallback: keep using local disk storage
+      storedPath = path.relative(process.cwd(), file.path).replace(/\\/g, '/');
+    }
 
     const galleryItem = await GalleryItem.create({
       user_id: req.user.user_id,
       title,
       description,
       type: isVideo ? 'video' : 'image',
-      file_path: path.relative(process.cwd(), file.path).replace(/\\/g, '/'),
+      file_path: storedPath,
       file_size: file.size,
       mime_type: file.mimetype,
-      width: null,
-      height: null,
-      duration: null,
-      thumbnail_path: null,
+      width,
+      height,
+      duration,
+      thumbnail_path: thumbPath,
       tags,
       is_private: !!req.body.is_private,
+      cloudinary_public_id: cloudinaryPublicId,
+      cloudinary_resource_type: cloudinaryResourceType,
     });
 
-    // Optionally bump per-cousin vault stats if you map users to cousins.
-
     const baseUrl = process.env.SITE_URL || (req.protocol + '://' + req.get('host'));
+    const fileUrl = buildFileUrl(baseUrl, galleryItem.file_path);
     sendSuccess(res, {
       id: galleryItem._id,
-      file_url: `${baseUrl}/${galleryItem.file_path}`,
+      file_url: fileUrl,
       title: galleryItem.title,
     }, 'File uploaded successfully');
   });
@@ -868,7 +907,17 @@ async function galleryDelete(req, res) {
       return sendError(res, 'Insufficient permissions', 403);
     }
 
-    // Delete file from disk if it exists
+    // Delete from Cloudinary if present
+    if (cloudinaryEnabled && item.cloudinary_public_id) {
+      try {
+        const resourceType = item.cloudinary_resource_type || (item.type === 'video' ? 'video' : 'image');
+        await cloudinary.uploader.destroy(item.cloudinary_public_id, { resource_type: resourceType });
+      } catch (err) {
+        console.error('Cloudinary destroy error', err);
+      }
+    }
+
+    // Delete file from disk if it exists (local fallback uploads)
     const fullPath = path.join(process.cwd(), item.file_path);
     if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
 
@@ -1273,7 +1322,7 @@ app.get('/get_profiles.php', async (req, res) => {
     const baseUrl = process.env.SITE_URL || (req.protocol + '://' + req.get('host'));
     profiles = profiles.map((p) => ({
       ...p,
-      photo_url: p.profile_photo_path ? `${baseUrl}/${p.profile_photo_path}` : null,
+      photo_url: buildFileUrl(baseUrl, p.profile_photo_path),
     }));
 
     if (cousin !== 'all' && profiles.length === 1) {
@@ -1310,7 +1359,7 @@ app.get('/get_uploads.php', async (req, res) => {
     const baseUrl = process.env.SITE_URL || (req.protocol + '://' + req.get('host'));
     const decorated = uploads.map((u) => ({
       ...u,
-      file_url: `${baseUrl}/${u.file_path}`,
+      file_url: buildFileUrl(baseUrl, u.file_path),
       is_image: u.file_type && u.file_type.startsWith('image/'),
       is_video: u.file_type && u.file_type.startsWith('video/'),
     }));
@@ -1365,7 +1414,7 @@ app.post('/save_profile.php', async (req, res) => {
     const baseUrl = process.env.SITE_URL || (req.protocol + '://' + req.get('host'));
     const withUrl = {
       ...profile.toObject(),
-      photo_url: profile.profile_photo_path ? `${baseUrl}/${profile.profile_photo_path}` : null,
+      photo_url: buildFileUrl(baseUrl, profile.profile_photo_path),
     };
 
     res.json({ success: true, message: 'Profile saved successfully', data: withUrl });
@@ -1377,6 +1426,16 @@ app.post('/save_profile.php', async (req, res) => {
 
 async function saveBase64Image(base64String, cousin) {
   try {
+    if (cloudinaryEnabled) {
+      // Upload base64 data URI directly to Cloudinary
+      const uploadResult = await cloudinary.uploader.upload(base64String, {
+        folder: `cousinsvault/profiles/${cousin}`,
+        resource_type: 'image',
+      });
+      return uploadResult.secure_url;
+    }
+
+    // Fallback: store on local disk under uploads/profiles
     const parts = base64String.split(',');
     if (parts.length !== 2) throw new Error('Invalid base64 format');
     const meta = parts[0];
