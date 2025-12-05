@@ -836,10 +836,14 @@ async function galleryUpload(req, res) {
       is_private: !!req.body.is_private,
     });
 
-    // Also record per-cousin upload and bump stats for the Vault view
-    const cousin = (req.user.username || '').toLowerCase();
+    // Also record per-cousin upload and bump stats for the Vault view.
+    // Prefer an explicit cousin from the request body (Vault modal),
+    // but fall back to the authenticated username.
+    let cousin = (req.body.cousin || req.user.username || '').toLowerCase();
     const allowedCousins = ['rubab', 'rahi', 'abir'];
-    if (allowedCousins.includes(cousin)) {
+    if (!allowedCousins.includes(cousin)) cousin = null;
+
+    if (cousin) {
       try {
         await CousinUpload.create({
           cousin,
